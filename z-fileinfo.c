@@ -27,7 +27,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define VERSION "0.1.0"
+#define VERSION "0.2.0"
 #define PROG    "z-fileinfo"
 
 /* -------------------------------------------------------------------------
@@ -160,77 +160,143 @@ static int query_od(const char *target, const char *filepath, Buf *out) {
 }
 
 /*
- * amblist query — run amblist LISTLOAD OUTPUT=MODLIST on a USS program object
- * or LISTOBJ for a .o file, then extract the key summary fields:
+ * amblist query — run amblist LISTLOAD OUTPUT=MODLIST on a USS program object,
+ * then extract key attributes:
  *
- *   Module Summary  : MEMBER NAME, AMODE, RMODE, XPLINK, PO FORMAT, OS COMPAT LEVEL
- *   ASCII mode      : C_COPTIONS text decoded — look for "ASCII" vs "NOASCII" token
- *   External refs   : @@Axxxxx names → ASCII-mode DLL stubs; plain names → EBCDIC
- *   MAPPED attribute: present on ER records in EBCDIC build; absent in ASCII build
+ *   Module Summary : MEMBER NAME, AMODE, RMODE, XPLINK, PO FORMAT, OS COMPAT LEVEL
+ *   ASCII mode     : PRIMARY — PMARL byte at word-18 offset (bit 0x20); works for
+ *                    ALL binary types (Go, XL C, assembler, PL/X).
+ *                    SECONDARY — C_COPTIONS EBCDIC pattern (XL C only, confirmation).
+ *   Binary type    : Go (G_CODE64 / PPA2(LD) ESD); XL C (C_CODE64 / C_COPTIONS);
+ *                    LE runtime only (no user CSECTs); other
+ *   External refs  : @@Axxxxx names → ASCII-mode DLL stubs
  *
- * We use sed/grep on the remote side to extract only what we need so the
- * SSH pipe stays small even for large program objects.
+ * PMARL ASCII flag (primary, cross-language):
+ *   The PDSE member directory extension (PMARL) records a flags byte at word 18
+ *   (0-based, byte offset 72 = 0x48 from the first PMARL word).
+ *   Bit 0x20 of that byte is the ASCII mode indicator:
+ *     1 → binary runs in ASCII mode (ASCII XL C build, Go binary)
+ *     0 → binary runs in EBCDIC mode (EBCDIC XL C build, assembler default)
+ *
+ *   PMARL is printed by amblist at the top of the module listing as three
+ *   continuation lines after the 'PMARL XXXXXXXX ...' header line.
+ *   The relevant byte is the first byte of the third word on the third line.
+ *
+ * C_COPTIONS (secondary, XL C only):
+ *   EBCDIC 'NOASCII' = D5 D6 C1 E2 C3 C9 C9
+ *   EBCDIC 'ASCII'   = C1 E2 C3 C9 C9
  */
 static int query_amblist(const char *target, const char *filepath, Buf *out) {
     /*
-     * Remote script:
-     *  1. Run amblist LISTLOAD OUTPUT=MODLIST, capture to a temp file.
-     *  2. Print the Module Summary section (up to the dotted separator after XPLINK).
-     *  3. Print the C_COPTIONS text line that contains ASCII/NOASCII.
-     *  4. Print a sample of external reference names (ER records) to show @@A vs real names.
-     *  5. Clean up.
+     * The amblist output is EBCDIC with ASA carriage-control in column 1:
+     *   0xF1 ('1') = form feed/new page
+     *   0xF0 ('0') = double space
+     *   0x40 (' ') = single space
+     *   0x60 ('-') = triple space
+     * Content starts at column 2 → strip with substr($0,2) in awk.
      *
-     * The COPTIONS text is stored in EBCDIC inside the binary; amblist decodes it
-     * and prints it as ASCII in the rightmost "character" column of the od-style dump.
-     * The printable column is everything after the last two spaces following the hex dump
-     * on each line — e.g.:  "000000020  ...hex...  *ARGPARSE.NOASCII.ASSERT...*"
-     * We grep for the token "ASCII" or "NOASCII" in those character columns.
+     * PMARL line extraction:
+     *   'PMARL' in EBCDIC = D7 D4 C1 D9 D3 — use printf pattern + grep -f.
+     *   Lines follow: the PMARL header line (contains the word 'PMARL') then
+     *   3 continuation lines (the third holds the word-18 byte).
+     *   awk: find PMARL header, collect next 3 continuation lines, then
+     *   from line 3 extract field 3 (awk $3), take the leading 2 hex chars.
      *
-     * We also look at external reference (ER) names: in an ASCII-mode build the XL C
-     * compiler maps POSIX function names to @@Axxxxx stub names; in EBCDIC mode the
-     * real symbol names (fprintf, open, etc.) are used directly.  The presence of
-     * "MAPPED" on ER ATTRIBUTES lines is the EBCDIC indicator.
-     */
-    /*
-     * The amblist output file is EBCDIC (z/OS ASA carriage-control format).
-     * Print-control character is in column 1:
-     *   '1' (0xF1) = form feed / new page
-     *   '0' (0xF0) = double space (blank line before content)
-     *   ' ' (0x40) = single space
-     *   '-' (0x60) = triple space
-     * Content starts at column 2.
-     *
-     * C_COPTIONS: the compiler options string is stored in EBCDIC inside the
-     * program object.  amblist prints it as the rightmost character column of
-     * its od-style hex dump, bracketed by EBCDIC '*' (0x5C).  We extract the
-     * raw EBCDIC bytes between the '*' markers from the TEXT=C_COPTIONS section,
-     * then search for known EBCDIC byte sequences:
-     *   NOASCII = D5 D6 C1 E2 C3 C9 C9  (EBCDIC "NOASCII")
-     *   ASCII   = C1 E2 C3 C9 C9        (EBCDIC "ASCII")
-     * Using printf hex-escape patterns avoids iconv and tr portability issues.
-     * grep -f matches binary patterns.
+     * C_COPTIONS extraction (XL C confirmation):
+     *   Grab raw EBCDIC bytes between '*' markers in C_COPTIONS TEXT section.
+     *   Search for NOASCII / ASCII byte patterns.
      */
     char cmd[8192];
     snprintf(cmd, sizeof(cmd),
+        /* Run amblist, capture to temp file */
         "TMP=/tmp/zfi_$$ ; "
         "echo ' LISTLOAD OUTPUT=MODLIST' | amblist '%s' > \"$TMP\" 2>&1 ; "
         "RC=$? ; "
-        /*
-         * 1. Module Summary — strip print-control col 1, show key label lines.
-         *    The MODULE SUMMARY section starts after the '**** M O D U L E ****'
-         *    banner and runs until the first page of formatted output.
-         *    We grab up to 60 lines after the banner and filter for label fields.
-         */
+
+        /* ---- 1. Module Summary ----------------------------------------- */
         "echo '=== AMBLIST MODULE SUMMARY ===' ; "
-        "awk '/M O D U L E.*S U M M A R Y/{f=1;n=0} f{n++;print substr($0,2); if(n>60)exit}' \"$TMP\" | "
-        "grep -E 'MEMBER NAME|MAIN ENTRY POINT:|AMODE OF MAIN|MODULE SSI|APFCODE|^[[:space:]]*RMODE:|LONGPARM|PO FORMAT|OS COMPAT|^[[:space:]]*XPLINK|PROCESSED BY' | "
+        "awk '/M O D U L E.*S U M M A R Y/{f=1;n=0} "
+             "f{n++;print substr($0,2); if(n>60)exit}' \"$TMP\" | "
+        "grep -E 'MEMBER NAME|MAIN ENTRY POINT:|AMODE OF MAIN|MODULE SSI|"
+                  "APFCODE|^[[:space:]]*RMODE:|LONGPARM|PO FORMAT|OS COMPAT|"
+                  "^[[:space:]]*XPLINK|PROCESSED BY' | "
         "sed 's/^[[:space:]]*//' | tr -s ' ' ; "
+
+        /* ---- 2. Binary type fingerprint ---------------------------------- */
         /*
-         * 2. ASCII/EBCDIC mode verdict from C_COPTIONS.
-         *    Extract raw EBCDIC bytes from the '*...*' character column of all
-         *    '===== TEXT =====.*C_COPTIONS' sections (there can be multiple
-         *    across page breaks for the same CSECT).  Search those bytes for
-         *    EBCDIC 'NOASCII' (D5 D6 C1 E2 C3 C9 C9) or 'ASCII' (C1 E2 C3 C9 C9).
+         * Go binaries use G_CODE64 class and expose PPA2(LD) as a named ESD.
+         * XL C uses C_CODE64 and C_COPTIONS.
+         * Assembler and PL/X use B_TEXT and no C_COPTIONS.
+         */
+        "echo '=== BINARY TYPE ===' ; "
+        "HAS_GCODE=0 ; HAS_PPA2LD=0 ; HAS_COPTS=0 ; HAS_CCODE=0 ; "
+        "grep -l 'G_CODE64' \"$TMP\" > /dev/null 2>&1 && HAS_GCODE=1 ; "
+        "grep -l 'PPA2(LD)' \"$TMP\" > /dev/null 2>&1 && HAS_PPA2LD=1 ; "
+        "grep -l 'C_COPTIONS' \"$TMP\" > /dev/null 2>&1 && HAS_COPTS=1 ; "
+        "grep -l 'C_CODE64' \"$TMP\" > /dev/null 2>&1 && HAS_CCODE=1 ; "
+        "if [ \"$HAS_GCODE\" = 1 ] ; then "
+        "  echo 'BINARY_TYPE: Go (G_CODE64 class, PPA2(LD) ESD)' ; "
+        "elif [ \"$HAS_COPTS\" = 1 ] && [ \"$HAS_CCODE\" = 1 ] ; then "
+        "  echo 'BINARY_TYPE: XL C/C++ (C_CODE64 + C_COPTIONS)' ; "
+        "elif [ \"$HAS_CCODE\" = 1 ] ; then "
+        "  echo 'BINARY_TYPE: C/C++ (C_CODE64, no C_COPTIONS)' ; "
+        "else "
+        "  echo 'BINARY_TYPE: Assembler/PL/X or LE-runtime-only (no C_CODE64)' ; "
+        "fi ; "
+
+        /* ---- 3. ASCII/EBCDIC mode — PMARL method (primary) --------------- */
+        /*
+         * PMARL word 18 (byte offset 72 = 0x48), first byte: bit 0x20 = ASCII.
+         * PMARL text layout (each line = 8 hex words):
+         *   header line:  PMARL w0 w1 w2 w3   w4 w5 w6 w7
+         *   cont line 1:        w8 w9 w10 w11  w12 w13 w14 w15
+         *   cont line 2:        w16 w17 w18 w19 ...
+         * Word 18 is the 3rd word on cont line 2 (awk field $3 after leading space strip).
+         *
+         * awk strategy: match 'PMARL ' at start of content (col 2 onward), then
+         * count continuation lines; on the 3rd extract field 3.
+         * The amblist PMARL line is grep-visible — awk /PMARL / matches it directly.
+         */
+        "echo '=== ASCII/EBCDIC MODE (PMARL) ===' ; "
+        "PMARL_WORD18=$(awk '"
+        "  /PMARL [0-9A-Fa-f]/ { in_pmarl=1; cont=0; next }"
+        "  in_pmarl {"
+        "    cont++;"
+        "    if (cont == 2) {"
+        /*
+         * Default awk field split (any whitespace run):
+         * cont line 2 fields: $1=w16 $2=w17 $3=w18 $4=w19 ...
+         * (the 3-space gap between the two groups of 4 is collapsed)
+         */
+        "      if (NF >= 3) print $3;"
+        "      in_pmarl = 0;"
+        "    }"
+        "    next;"
+        "  }"
+        "' \"$TMP\" 2>/dev/null) ; "
+        "if [ -n \"$PMARL_WORD18\" ] ; then "
+        /*
+         * Extract first byte (first 2 hex chars) of PMARL word 18.
+         * Shell arithmetic: $(( 16#XX )) converts hex to decimal.
+         * ASCII flag = byte & 0x20 (decimal 32).
+         */
+        "  BYTE18=$(echo \"$PMARL_WORD18\" | cut -c1-2) ; "
+        "  BVAL=$(( 16#${BYTE18} )) ; "
+        "  ASCII_FLAG=$(( BVAL & 32 )) ; "
+        "  if [ \"$ASCII_FLAG\" != 0 ] ; then "
+        "    echo 'ASCII_MODE: YES (PMARL bit 0x20 set)' ; "
+        "  else "
+        "    echo 'ASCII_MODE: NO  (PMARL bit 0x20 clear — EBCDIC mode)' ; "
+        "  fi ; "
+        "  echo \"PMARL_WORD18: $PMARL_WORD18 (byte[0]=0x${BYTE18})\" ; "
+        "else "
+        "  echo 'ASCII_MODE: UNKNOWN (PMARL not found in amblist output)' ; "
+        "fi ; "
+
+        /* ---- 4. C_COPTIONS confirmation (XL C only) ---------------------- */
+        /*
+         * Extract raw EBCDIC bytes from '*...*' char-column of C_COPTIONS TEXT.
+         * Search for NOASCII (D5 D6 C1 E2 C3 C9 C9) or ASCII (C1 E2 C3 C9 C9).
          */
         "COPTS=/tmp/zfi_copts_$$ ; "
         "awk '"
@@ -242,29 +308,21 @@ static int query_amblist(const char *target, const char *filepath, Buf *out) {
         "' \"$TMP\" > \"$COPTS\" ; "
         "printf '\\xD5\\xD6\\xC1\\xE2\\xC3\\xC9\\xC9' > /tmp/zfi_pat_no_$$ ; "
         "printf '\\xC1\\xE2\\xC3\\xC9\\xC9'           > /tmp/zfi_pat_yes_$$ ; "
-        "echo '=== ASCII/EBCDIC MODE ===' ; "
+        "echo '=== C_COPTIONS (XL C confirmation) ===' ; "
         "if grep -l -f /tmp/zfi_pat_no_$$  \"$COPTS\" > /dev/null 2>&1 ; then "
-        "  echo 'ASCII_MODE: NO  (EBCDIC build - NOASCII compiler flag)' ; "
+        "  echo 'COPTIONS: NOASCII (EBCDIC XL C build)' ; "
         "elif grep -l -f /tmp/zfi_pat_yes_$$ \"$COPTS\" > /dev/null 2>&1 ; then "
-        "  echo 'ASCII_MODE: YES (ASCII build - ASCII compiler flag)' ; "
+        "  echo 'COPTIONS: ASCII (ASCII XL C build)' ; "
         "else "
-        "  echo 'ASCII_MODE: UNKNOWN (no C_COPTIONS section in output)' ; "
+        "  echo 'COPTIONS: N/A (no C_COPTIONS section — not an XL C binary)' ; "
         "fi ; "
-        /*
-         * 3. External reference names (ER records).
-         *    ASCII builds: POSIX names are mapped to @@Axxxxx stub symbols.
-         *    EBCDIC builds: real names (fprintf, open, getopt, …) are used.
-         */
+
+        /* ---- 5. External reference sample (ER records) ------------------- */
         "echo '=== EXTERNAL REFERENCES (ER) sample ===' ; "
-        "grep '(ER)' \"$TMP\" | grep -v '^[[:space:]]*$' | head -20 | "
+        "grep '(ER)' \"$TMP\" | grep -v '^[[:space:]]*$' | head -15 | "
         "awk '{print substr($0,2)}' ; "
-        /*
-         * 4. MAPPED attribute on ER records.
-         *    In EBCDIC builds the linker marks resolved EBCDIC-DLL stubs MAPPED.
-         *    In ASCII builds those stubs are @@A… symbols — MAPPED is absent.
-         */
-        "echo '=== MAPPED attribute (present=EBCDIC build, absent=ASCII build) ===' ; "
-        "grep 'MAPPED' \"$TMP\" | head -5 | awk '{print substr($0,2)}' ; "
+
+        /* ---- cleanup ------------------------------------------------------ */
         "echo \"amblist exit: $RC\" ; "
         "rm -f \"$TMP\" \"$COPTS\" /tmp/zfi_pat_no_$$ /tmp/zfi_pat_yes_$$",
         filepath);
@@ -500,7 +558,9 @@ static void mcp_handle_tools_list(const char *id) {
             "{"
               "\"name\":\"z_fileinfo_query\","
               "\"description\":\"Query file information on a remote z/OS USS system over SSH using BCP-standard commands only. "
-                "Supports /bin/file identification, ls -la listing, stat(1) metadata, /bin/od hex dump of first 32 bytes, or all four combined.\","
+                "Supports /bin/file identification, ls -la listing, stat(1) metadata, /bin/od hex dump of first 32 bytes, "
+                "amblist program-object analysis (ASCII/EBCDIC mode via PMARL bit 0x20, binary type Go/XL-C/asm, "
+                "XPLINK, ER names — works for Go binaries, XL C/C++, assembler, PL/X), or all combined.\","
               "\"inputSchema\":{"
                 "\"type\":\"object\","
                 "\"properties\":{"
