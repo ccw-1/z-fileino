@@ -144,18 +144,18 @@ static int query_ls(const char *target, const char *filepath, Buf *out) {
     return ssh_run(target, cmd, out);
 }
 
-/* stat <filepath> — POSIX stat(1); USS BCP includes it */
+/* ls -laT <filepath> — detailed listing with z/OS file tag (CCSID, T=on/off) */
 static int query_stat(const char *target, const char *filepath, Buf *out) {
     char cmd[4096];
-    snprintf(cmd, sizeof(cmd), "stat '%s' 2>&1", filepath);
+    snprintf(cmd, sizeof(cmd), "ls -laT '%s' 2>&1", filepath);
     return ssh_run(target, cmd, out);
 }
 
-/* /bin/od -A x -t x1z -N 32 <filepath> — first 32 bytes hex dump */
+/* /bin/od -A x -t x1 -N 32 <filepath> — first 32 bytes hex dump (POSIX od) */
 static int query_od(const char *target, const char *filepath, Buf *out) {
     char cmd[4096];
     snprintf(cmd, sizeof(cmd),
-             "/bin/od -A x -t x1z -N 32 '%s' 2>&1", filepath);
+             "/bin/od -A x -t x1 -N 32 '%s' 2>&1", filepath);
     return ssh_run(target, cmd, out);
 }
 
@@ -165,8 +165,8 @@ static int query_all(const char *target, const char *filepath, Buf *out) {
     snprintf(cmd, sizeof(cmd),
              "echo '=== /bin/file ===' && /bin/file '%s' 2>&1 ; "
              "echo '=== ls -la ===' && ls -la '%s' 2>&1 ; "
-             "echo '=== stat ===' && stat '%s' 2>&1 ; "
-             "echo '=== od (first 32 bytes) ===' && /bin/od -A x -t x1z -N 32 '%s' 2>&1",
+             "echo '=== ls -laT (tag) ===' && ls -laT '%s' 2>&1 ; "
+             "echo '=== od (first 32 bytes) ===' && /bin/od -A x -t x1 -N 32 '%s' 2>&1",
              filepath, filepath, filepath, filepath);
     return ssh_run(target, cmd, out);
 }
@@ -185,7 +185,7 @@ static void usage(void) {
         "Usage:\n"
         "  " PROG " [user@]host <filepath>          /bin/file (default)\n"
         "  " PROG " [user@]host -ls   <filepath>    ls -la\n"
-        "  " PROG " [user@]host -stat <filepath>    stat(1)\n"
+        "  " PROG " [user@]host -stat <filepath>    ls -laT (tag info)\n"
         "  " PROG " [user@]host -od   <filepath>    /bin/od hex dump (first 32 bytes)\n"
         "  " PROG " [user@]host -all  <filepath>    all of the above\n"
         "  " PROG " -help                           show this message\n"
@@ -451,8 +451,8 @@ static void mcp_handle_help(const char *id) {
         "Uses only BCP-standard commands (no extra packages on z/OS):\n"
         "  file  /bin/file <filepath>                    — file type identification\n"
         "  ls    ls -la <filepath>                       — detailed directory listing\n"
-        "  stat  stat <filepath>                         — file metadata (inode, size, times)\n"
-        "  od    /bin/od -A x -t x1z -N 32 <filepath>   — first 32 bytes hex dump\n"
+        "  stat  ls -laT <filepath>                     — listing with z/OS tag (CCSID, T=on/off)\n"
+        "  od    /bin/od -A x -t x1 -N 32 <filepath>   — first 32 bytes hex dump (POSIX od)\n"
         "  all   all four commands combined\n"
         "\n"
         "MCP tool: z_fileinfo_query(target, filepath, mode)\n"
