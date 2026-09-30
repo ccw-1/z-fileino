@@ -3,7 +3,7 @@
 CC      ?= gcc
 CFLAGS  ?= -std=c11 -Wall -Wextra -O2
 
-PREFIX  ?= /home/knoppix/local/bin
+PREFIX  ?= /usr/local/bin
 
 .PHONY: all clean install
 
