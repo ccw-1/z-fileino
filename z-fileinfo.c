@@ -159,7 +159,119 @@ static int query_od(const char *target, const char *filepath, Buf *out) {
     return ssh_run(target, cmd, out);
 }
 
-/* All four queries combined */
+/*
+ * amblist query — run amblist LISTLOAD OUTPUT=MODLIST on a USS program object
+ * or LISTOBJ for a .o file, then extract the key summary fields:
+ *
+ *   Module Summary  : MEMBER NAME, AMODE, RMODE, XPLINK, PO FORMAT, OS COMPAT LEVEL
+ *   ASCII mode      : C_COPTIONS text decoded — look for "ASCII" vs "NOASCII" token
+ *   External refs   : @@Axxxxx names → ASCII-mode DLL stubs; plain names → EBCDIC
+ *   MAPPED attribute: present on ER records in EBCDIC build; absent in ASCII build
+ *
+ * We use sed/grep on the remote side to extract only what we need so the
+ * SSH pipe stays small even for large program objects.
+ */
+static int query_amblist(const char *target, const char *filepath, Buf *out) {
+    /*
+     * Remote script:
+     *  1. Run amblist LISTLOAD OUTPUT=MODLIST, capture to a temp file.
+     *  2. Print the Module Summary section (up to the dotted separator after XPLINK).
+     *  3. Print the C_COPTIONS text line that contains ASCII/NOASCII.
+     *  4. Print a sample of external reference names (ER records) to show @@A vs real names.
+     *  5. Clean up.
+     *
+     * The COPTIONS text is stored in EBCDIC inside the binary; amblist decodes it
+     * and prints it as ASCII in the rightmost "character" column of the od-style dump.
+     * The printable column is everything after the last two spaces following the hex dump
+     * on each line — e.g.:  "000000020  ...hex...  *ARGPARSE.NOASCII.ASSERT...*"
+     * We grep for the token "ASCII" or "NOASCII" in those character columns.
+     *
+     * We also look at external reference (ER) names: in an ASCII-mode build the XL C
+     * compiler maps POSIX function names to @@Axxxxx stub names; in EBCDIC mode the
+     * real symbol names (fprintf, open, etc.) are used directly.  The presence of
+     * "MAPPED" on ER ATTRIBUTES lines is the EBCDIC indicator.
+     */
+    /*
+     * The amblist output file is EBCDIC (z/OS ASA carriage-control format).
+     * Print-control character is in column 1:
+     *   '1' (0xF1) = form feed / new page
+     *   '0' (0xF0) = double space (blank line before content)
+     *   ' ' (0x40) = single space
+     *   '-' (0x60) = triple space
+     * Content starts at column 2.
+     *
+     * C_COPTIONS: the compiler options string is stored in EBCDIC inside the
+     * program object.  amblist prints it as the rightmost character column of
+     * its od-style hex dump, bracketed by EBCDIC '*' (0x5C).  We extract the
+     * raw EBCDIC bytes between the '*' markers from the TEXT=C_COPTIONS section,
+     * then search for known EBCDIC byte sequences:
+     *   NOASCII = D5 D6 C1 E2 C3 C9 C9  (EBCDIC "NOASCII")
+     *   ASCII   = C1 E2 C3 C9 C9        (EBCDIC "ASCII")
+     * Using printf hex-escape patterns avoids iconv and tr portability issues.
+     * grep -f matches binary patterns.
+     */
+    char cmd[8192];
+    snprintf(cmd, sizeof(cmd),
+        "TMP=/tmp/zfi_$$ ; "
+        "echo ' LISTLOAD OUTPUT=MODLIST' | amblist '%s' > \"$TMP\" 2>&1 ; "
+        "RC=$? ; "
+        /*
+         * 1. Module Summary — strip print-control col 1, show key label lines.
+         *    The MODULE SUMMARY section starts after the '**** M O D U L E ****'
+         *    banner and runs until the first page of formatted output.
+         *    We grab up to 60 lines after the banner and filter for label fields.
+         */
+        "echo '=== AMBLIST MODULE SUMMARY ===' ; "
+        "awk '/M O D U L E.*S U M M A R Y/{f=1;n=0} f{n++;print substr($0,2); if(n>60)exit}' \"$TMP\" | "
+        "grep -E 'MEMBER NAME|MAIN ENTRY POINT:|AMODE OF MAIN|MODULE SSI|APFCODE|^[[:space:]]*RMODE:|LONGPARM|PO FORMAT|OS COMPAT|^[[:space:]]*XPLINK|PROCESSED BY' | "
+        "sed 's/^[[:space:]]*//' | tr -s ' ' ; "
+        /*
+         * 2. ASCII/EBCDIC mode verdict from C_COPTIONS.
+         *    Extract raw EBCDIC bytes from the '*...*' character column of all
+         *    '===== TEXT =====.*C_COPTIONS' sections (there can be multiple
+         *    across page breaks for the same CSECT).  Search those bytes for
+         *    EBCDIC 'NOASCII' (D5 D6 C1 E2 C3 C9 C9) or 'ASCII' (C1 E2 C3 C9 C9).
+         */
+        "COPTS=/tmp/zfi_copts_$$ ; "
+        "awk '"
+        "  /===== TEXT =====.*C_COPTIONS/ { f=1; next }"
+        "  f && index($0,\"*\")>0 {"
+        "    s = substr($0, index($0,\"*\")+1);"
+        "    sub(/[*].*/,\"\",s); printf \"%%s\",s; next }"
+        "  f { f=0 }"
+        "' \"$TMP\" > \"$COPTS\" ; "
+        "printf '\\xD5\\xD6\\xC1\\xE2\\xC3\\xC9\\xC9' > /tmp/zfi_pat_no_$$ ; "
+        "printf '\\xC1\\xE2\\xC3\\xC9\\xC9'           > /tmp/zfi_pat_yes_$$ ; "
+        "echo '=== ASCII/EBCDIC MODE ===' ; "
+        "if grep -l -f /tmp/zfi_pat_no_$$  \"$COPTS\" > /dev/null 2>&1 ; then "
+        "  echo 'ASCII_MODE: NO  (EBCDIC build - NOASCII compiler flag)' ; "
+        "elif grep -l -f /tmp/zfi_pat_yes_$$ \"$COPTS\" > /dev/null 2>&1 ; then "
+        "  echo 'ASCII_MODE: YES (ASCII build - ASCII compiler flag)' ; "
+        "else "
+        "  echo 'ASCII_MODE: UNKNOWN (no C_COPTIONS section in output)' ; "
+        "fi ; "
+        /*
+         * 3. External reference names (ER records).
+         *    ASCII builds: POSIX names are mapped to @@Axxxxx stub symbols.
+         *    EBCDIC builds: real names (fprintf, open, getopt, …) are used.
+         */
+        "echo '=== EXTERNAL REFERENCES (ER) sample ===' ; "
+        "grep '(ER)' \"$TMP\" | grep -v '^[[:space:]]*$' | head -20 | "
+        "awk '{print substr($0,2)}' ; "
+        /*
+         * 4. MAPPED attribute on ER records.
+         *    In EBCDIC builds the linker marks resolved EBCDIC-DLL stubs MAPPED.
+         *    In ASCII builds those stubs are @@A… symbols — MAPPED is absent.
+         */
+        "echo '=== MAPPED attribute (present=EBCDIC build, absent=ASCII build) ===' ; "
+        "grep 'MAPPED' \"$TMP\" | head -5 | awk '{print substr($0,2)}' ; "
+        "echo \"amblist exit: $RC\" ; "
+        "rm -f \"$TMP\" \"$COPTS\" /tmp/zfi_pat_no_$$ /tmp/zfi_pat_yes_$$",
+        filepath);
+    return ssh_run(target, cmd, out);
+}
+
+/* All queries combined */
 static int query_all(const char *target, const char *filepath, Buf *out) {
     char cmd[4096];
     snprintf(cmd, sizeof(cmd),
@@ -183,11 +295,12 @@ static void usage(void) {
         "Uses only BCP-standard commands — no extra packages required on z/OS.\n"
         "\n"
         "Usage:\n"
-        "  " PROG " [user@]host <filepath>          /bin/file (default)\n"
-        "  " PROG " [user@]host -ls   <filepath>    ls -la\n"
-        "  " PROG " [user@]host -stat <filepath>    ls -laT (tag info)\n"
-        "  " PROG " [user@]host -od   <filepath>    /bin/od hex dump (first 32 bytes)\n"
-        "  " PROG " [user@]host -all  <filepath>    all of the above\n"
+        "  " PROG " [user@]host <filepath>             /bin/file (default)\n"
+        "  " PROG " [user@]host -ls      <filepath>    ls -la\n"
+        "  " PROG " [user@]host -stat    <filepath>    ls -laT (tag info)\n"
+        "  " PROG " [user@]host -od      <filepath>    /bin/od hex dump (first 32 bytes)\n"
+        "  " PROG " [user@]host -amblist <filepath>    amblist: ASCII/EBCDIC mode, AMODE, XPLINK, ER names\n"
+        "  " PROG " [user@]host -all     <filepath>    all of the above\n"
         "  " PROG " -help                           show this message\n"
         "  " PROG " -version                        print version\n"
         "\n"
@@ -252,6 +365,8 @@ int main(int argc, char **argv) {
         rc = query_stat(target, filepath, &out);
     } else if (strcmp(mode, "-od") == 0 || strcmp(mode, "--od") == 0) {
         rc = query_od(target, filepath, &out);
+    } else if (strcmp(mode, "-amblist") == 0 || strcmp(mode, "--amblist") == 0) {
+        rc = query_amblist(target, filepath, &out);
     } else if (strcmp(mode, "-all") == 0 || strcmp(mode, "--all") == 0) {
         rc = query_all(target, filepath, &out);
     } else {
@@ -394,8 +509,8 @@ static void mcp_handle_tools_list(const char *id) {
                   "\"filepath\":{\"type\":\"string\","
                     "\"description\":\"Absolute or relative path of the file to inspect on the remote z/OS system.\"},"
                   "\"mode\":{\"type\":\"string\","
-                    "\"description\":\"Query mode: file (default) | ls | stat | od | all\","
-                    "\"enum\":[\"file\",\"ls\",\"stat\",\"od\",\"all\"]}"
+                    "\"description\":\"Query mode: file (default) | ls | stat | od | amblist | all\","
+                    "\"enum\":[\"file\",\"ls\",\"stat\",\"od\",\"amblist\",\"all\"]}"
                 "},"
                 "\"required\":[\"target\",\"filepath\"]"
               "}"
@@ -421,14 +536,15 @@ static void mcp_handle_query(const char *id, const char *args) {
     Buf out; buf_init(&out);
     int rc = 0;
 
-    if (strcmp(mode,"file")==0)      rc = query_file (target, filepath, &out);
-    else if (strcmp(mode,"ls")==0)   rc = query_ls   (target, filepath, &out);
-    else if (strcmp(mode,"stat")==0) rc = query_stat (target, filepath, &out);
-    else if (strcmp(mode,"od")==0)   rc = query_od   (target, filepath, &out);
-    else if (strcmp(mode,"all")==0)  rc = query_all  (target, filepath, &out);
+    if (strcmp(mode,"file")==0)         rc = query_file    (target, filepath, &out);
+    else if (strcmp(mode,"ls")==0)      rc = query_ls      (target, filepath, &out);
+    else if (strcmp(mode,"stat")==0)    rc = query_stat    (target, filepath, &out);
+    else if (strcmp(mode,"od")==0)      rc = query_od      (target, filepath, &out);
+    else if (strcmp(mode,"amblist")==0) rc = query_amblist (target, filepath, &out);
+    else if (strcmp(mode,"all")==0)     rc = query_all     (target, filepath, &out);
     else {
         char msg[128];
-        snprintf(msg,sizeof(msg),"unknown mode '%s'; use file|ls|stat|od|all", mode);
+        snprintf(msg,sizeof(msg),"unknown mode '%s'; use file|ls|stat|od|amblist|all", mode);
         send_error(id,-32602,msg);
         buf_free(&out); return;
     }
@@ -449,16 +565,17 @@ static void mcp_handle_help(const char *id) {
         "z-fileinfo — file information queries on remote z/OS USS via SSH.\n"
         "\n"
         "Uses only BCP-standard commands (no extra packages on z/OS):\n"
-        "  file  /bin/file <filepath>                    — file type identification\n"
-        "  ls    ls -la <filepath>                       — detailed directory listing\n"
-        "  stat  ls -laT <filepath>                     — listing with z/OS tag (CCSID, T=on/off)\n"
-        "  od    /bin/od -A x -t x1 -N 32 <filepath>   — first 32 bytes hex dump (POSIX od)\n"
-        "  all   all four commands combined\n"
+        "  file     /bin/file <filepath>                   — file type identification\n"
+        "  ls       ls -la <filepath>                      — detailed directory listing\n"
+        "  stat     ls -laT <filepath>                     — listing with z/OS tag (CCSID, T=on/off)\n"
+        "  od       /bin/od -A x -t x1 -N 32 <filepath>   — first 32 bytes hex dump (POSIX od)\n"
+        "  amblist  amblist LISTLOAD OUTPUT=MODLIST        — ASCII/EBCDIC mode, AMODE, XPLINK, ER names\n"
+        "  all      all five commands combined\n"
         "\n"
         "MCP tool: z_fileinfo_query(target, filepath, mode)\n"
         "  target   : [user@]host  (e.g. pok56 or ccw@pok56)\n"
         "  filepath : path on the remote z/OS system\n"
-        "  mode     : file (default) | ls | stat | od | all\n"
+        "  mode     : file (default) | ls | stat | od | amblist | all\n"
         "\n"
         "Examples:\n"
         "  z_fileinfo_query(target='pok56', filepath='/u/ccw/hello')\n"
